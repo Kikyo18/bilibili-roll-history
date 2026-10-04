@@ -2,10 +2,14 @@
 // @name        bilibili-roll-history
 // @namespace   Violentmonkey Scripts
 // @match       https://www.bilibili.com/
+// @match       https://www.bilibili.com/?*
+// @match       https://www.bilibili.com/index.html
+// @match       https://www.bilibili.com/index.html?*
 // @run-at      document-start
 // @inject-into page
+// @sandbox     raw
 // @grant       none
-// @version     2.0.1
+// @version     2.0.3
 // @author      mesimpler
 // @description 为 B 站首页添加“换一换”历史回溯功能。
 // @license     MIT
@@ -34,9 +38,10 @@
   let replayTargetIndex = null;
   let replayTimeoutId = null;
   let pendingOperationCount = 0;
-  let snapshotQueue = Promise.resolve();
   let backButton = null;
   let nextButton = null;
+  let boundRollButton = null;
+  let statusMessage = "";
 
   installFetchInterceptor();
   installControlsWhenReady();
@@ -47,36 +52,75 @@
       return;
     }
 
-    window.fetch = async function bilibiliRollHistoryFetch(...argumentsList) {
-      if (!isRecommendationRequest(argumentsList[0])) {
+    window.fetch = function bilibiliRollHistoryFetch(...argumentsList) {
+      const requestType = getRecommendationRequestType(...argumentsList);
+      if (requestType === null) {
         return Reflect.apply(nativeFetch, window, argumentsList);
       }
+      return handleRecommendation(nativeFetch, argumentsList, requestType);
+    };
+  }
 
-      const replayIndex = consumeReplayTarget();
+  async function handleRecommendation(nativeFetch, argumentsList, requestType) {
+    pendingOperationCount += 1;
+    updateButtonStatus();
+    try {
+      const suppliedSignal = argumentsList[1]?.signal;
+      const signal = suppliedSignal !== undefined
+        ? suppliedSignal
+        : argumentsList[0] instanceof Request ? argumentsList[0].signal : undefined;
+      signal?.throwIfAborted();
+      // 只有换一换能领取回放目标，初始化或顶部刷新不能误用它。
+      const replayIndex = requestType === "3" ? consumeReplayTarget() : null;
       if (replayIndex !== null) {
         const snapshot = feedHistory[replayIndex];
         if (snapshot) {
           const response = createReplayResponse(snapshot);
           feedHistoryIndex = replayIndex;
-          updateButtonStatus();
+          statusMessage = "";
           return response;
         }
       }
 
-      pendingOperationCount += 1;
-      updateButtonStatus();
-      try {
-        const response = await Reflect.apply(nativeFetch, window, argumentsList);
-        queueSnapshot(response);
-        return response;
-      } finally {
-        pendingOperationCount -= 1;
-        updateButtonStatus();
+      const response = await Reflect.apply(nativeFetch, window, argumentsList);
+      if (!response.ok || !isJsonResponse(response)) {
+        throw new Error("推荐接口未返回有效数据");
       }
-    };
+      let responseClone;
+      try {
+        responseClone = response.clone();
+      } catch {
+        // 无法复制不代表页面无法读取；放行原响应，但不能保留旧索引。
+        clearHistory();
+        return response;
+      }
+      // 先验证正文再交给页面，错误数据不会被页面转换成空推荐列表。
+      const result = await createSnapshot(responseClone);
+      signal?.throwIfAborted();
+      if (result.status === "failed") {
+        const error = new Error("推荐加载失败，请重试");
+        error.code = result.code;
+        throw error;
+      }
+      if (result.status === "success") {
+        recordSnapshot(result.snapshot);
+      } else {
+        clearHistory();
+      }
+      statusMessage = "";
+      return response;
+    } catch (error) {
+      consumeReplayTarget();
+      statusMessage = feedHistory.length > 0
+        ? "推荐加载失败，已保留历史，可重试换一换"
+        : "推荐加载失败，请重试或刷新页面";
+      throw error;
+    } finally {
+      finishOperation();
+    }
   }
 
-  function isRecommendationRequest(input) {
+  function getRecommendationRequestType(input, options) {
     try {
       const requestUrl =
         input instanceof Request
@@ -85,53 +129,34 @@
             ? input.href
             : String(input);
       const url = new URL(requestUrl, window.location.href);
+      const method = options?.method ??
+        (input instanceof Request ? input.method : "GET");
+      const requestType = url.searchParams.get("fresh_type");
+      // 同一接口的 4 表示向下追加，不能记录成顶部换页或截断前进历史。
       return (
+        url.protocol === "https:" &&
         url.hostname === recommendationApiHostname &&
-        url.pathname === recommendationApiPath
-      );
+        url.pathname === recommendationApiPath &&
+        String(method).toUpperCase() === "GET" &&
+        ["0", "3", "5"].includes(requestType)
+      ) ? requestType : null;
     } catch {
-      return false;
+      return null;
     }
   }
 
-  function queueSnapshot(response) {
-    if (!response.ok || !isJsonResponse(response)) {
-      return;
-    }
-
-    const declaredLength = Number(response.headers.get("content-length"));
-    if (
-      Number.isFinite(declaredLength) &&
-      declaredLength > maxSnapshotBytes
-    ) {
-      clearHistory();
-      return;
-    }
-
-    let responseClone;
-    try {
-      responseClone = response.clone();
-    } catch {
-      return;
-    }
-
-    pendingOperationCount += 1;
-    updateButtonStatus();
-    snapshotQueue = snapshotQueue
-      .catch(() => undefined)
-      .then(() => createSnapshot(responseClone))
-      .then((result) => {
-        if (result.status === "success") {
-          recordSnapshot(result.snapshot);
-        } else if (result.status === "too-large") {
-          // 当前页面无法安全缓存时清空旧索引，避免按钮回放到错误页面。
-          clearHistory();
-        }
-      })
-      .finally(() => {
+  function finishOperation() {
+    const deadline = Date.now() + replayTimeoutMilliseconds;
+    const finishWhenRendered = () => {
+      // fetch 返回不等于 Vue 已完成换页；这段时间仍禁止连续回放。
+      if (getFeedData()?.loading && Date.now() < deadline) {
+        window.setTimeout(finishWhenRendered, 50);
+      } else {
         pendingOperationCount -= 1;
         updateButtonStatus();
-      });
+      }
+    };
+    window.setTimeout(finishWhenRendered, 0);
   }
 
   function isJsonResponse(response) {
@@ -141,14 +166,15 @@
 
   async function createSnapshot(response) {
     try {
-      const body = await response.arrayBuffer();
-      if (body.byteLength > maxSnapshotBytes) {
+      const body = await readSnapshotBody(response);
+      if (body === null) {
         return { status: "too-large" };
       }
 
-      const pageKey = createPageKeyFromBody(body);
+      const payload = JSON.parse(new TextDecoder().decode(body));
+      const pageKey = createPageKey(payload);
       if (!pageKey) {
-        return { status: "failed" };
+        return { status: "failed", code: payload?.code };
       }
 
       return {
@@ -172,6 +198,39 @@
     } catch {
       return { status: "failed" };
     }
+  }
+
+  async function readSnapshotBody(response) {
+    const reader = response.body?.getReader();
+    if (!reader) {
+      return new ArrayBuffer(0);
+    }
+    const chunks = [];
+    let length = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+        length += value.byteLength;
+        if (length > maxSnapshotBytes) {
+          // 克隆分支取消可能等待页面读取原响应，不能在这里 await。
+          void reader.cancel().catch(() => undefined);
+          return null;
+        }
+        chunks.push(value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    const body = new Uint8Array(length);
+    let offset = 0;
+    for (const chunk of chunks) {
+      body.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return body.buffer;
   }
 
   function recordSnapshot(snapshot) {
@@ -207,7 +266,7 @@
       return true;
     }
 
-    const recommendation = window.__pinia?.feed?.data?.recommend;
+    const recommendation = getFeedData()?.recommend;
     const payload = {
       code: 0,
       message: "0",
@@ -243,34 +302,44 @@
     return true;
   }
 
-  function createPageKeyFromBody(body) {
-    try {
-      const payload = JSON.parse(new TextDecoder().decode(body));
-      if (payload?.code !== 0) {
-        return null;
-      }
-      return createPageKey(payload);
-    } catch {
-      return null;
-    }
+  function getFeedData() {
+    const data = window.__pinia?.feed?.data;
+    return data?.__v_isRef ? data.value : data;
   }
 
   function createPageKey(payload) {
     const items = payload?.data?.item;
-    if (!Array.isArray(items) || items.length === 0) {
+    if (
+      payload?.code !== 0 ||
+      !Array.isArray(items) ||
+      items.length === 0 ||
+      items.some((item) => !item || typeof item !== "object" || Array.isArray(item))
+    ) {
       return null;
     }
 
-    return items
-      .map((item, index) => {
-        if (!item || typeof item !== "object") {
-          return `unknown:${index}`;
-        }
-        const identifier =
-          item.bvid ?? item.id ?? item.cid ?? item.uri ?? item.title ?? index;
-        return `${item.goto ?? "unknown"}:${String(identifier)}`;
-      })
-      .join("\u001f");
+    try {
+      return JSON.stringify(items.map((item) => {
+        const identifiers = item.goto === "ad"
+          ? [
+              item.business_info?.src_id,
+              item.business_info?.creative_id,
+              item.business_info?.archive?.aid,
+              item.bvid, item.id, item.cid, item.uri, item.title,
+            ]
+          : [item.bvid, item.id, item.cid, item.uri, item.title];
+        const identifier = identifiers.find((value) =>
+          (typeof value === "string" && value.trim() !== "") ||
+          (typeof value === "number" && Number.isFinite(value) && value > 0));
+        // 未知卡片比较内容，不能退化为固定位置；数组编码避免分隔符碰撞。
+        return [
+          item.goto ?? "unknown",
+          identifier === undefined ? item : String(identifier),
+        ];
+      }));
+    } catch {
+      return null;
+    }
   }
 
   function createReplayResponse(snapshot) {
@@ -313,6 +382,7 @@
     replayTimeoutId = window.setTimeout(() => {
       replayTargetIndex = null;
       replayTimeoutId = null;
+      statusMessage = "页面未响应历史切换，请重试或刷新页面";
       updateButtonStatus();
     }, replayTimeoutMilliseconds);
     updateButtonStatus();
@@ -346,17 +416,24 @@
   }
 
   function installControlsWhenReady() {
-    if (installControls()) {
-      return;
-    }
-
+    let scheduled = false;
     const observer = new MutationObserver(() => {
-      if (installControls()) {
-        // 控件安装后不再观察整页，避免常驻 DOM 监听开销。
-        observer.disconnect();
+      const controlsConnected = boundRollButton?.isConnected &&
+        backButton?.isConnected && nextButton?.isConnected &&
+        backButton.parentElement === boundRollButton.parentElement &&
+        nextButton.parentElement === boundRollButton.parentElement;
+      if (scheduled || controlsConnected) {
+        return;
       }
+      // 已连接时只检查引用；失联后按帧合并重装，避免每次变更扫描整页。
+      scheduled = true;
+      window.requestAnimationFrame(() => {
+        scheduled = false;
+        installControls();
+      });
     });
     observer.observe(document, { childList: true, subtree: true });
+    installControls();
   }
 
   function installControls() {
@@ -366,12 +443,12 @@
     }
 
     injectStyle();
-    if (!captureInitialSnapshot()) {
-      // 控件可能早于 Pinia 首屏数据就绪；首次换页前再做一次同步采集。
-      rollButton.addEventListener("click", captureInitialSnapshot, {
-        capture: true,
-        once: true,
-      });
+    captureInitialSnapshot();
+    if (boundRollButton !== rollButton) {
+      boundRollButton?.removeEventListener("click", captureInitialSnapshot, true);
+      // Pinia 可能晚于控件就绪；每次换页前补采，历史非空时立即返回。
+      rollButton.addEventListener("click", captureInitialSnapshot, true);
+      boundRollButton = rollButton;
     }
     if (!backButton || !nextButton) {
       backButton = createHistoryButton(
@@ -394,7 +471,12 @@
       });
     }
 
-    rollButton.parentElement.append(backButton, nextButton);
+    if (
+      backButton.parentElement !== rollButton.parentElement ||
+      nextButton.parentElement !== rollButton.parentElement
+    ) {
+      rollButton.parentElement.append(backButton, nextButton);
+    }
     updateButtonStatus();
     return true;
   }
@@ -425,7 +507,18 @@
 
     const style = document.createElement("style");
     style.id = "feed-roll-history-style";
+    // 原生 disabled 已阻止点击；保留命中测试才能显示禁用指针和提示。
     style.textContent = `
+      .feed-roll-btn .roll-btn,
+      .feed-roll-back-btn,
+      .feed-roll-next-btn {
+        cursor: pointer;
+      }
+      .feed-roll-btn .roll-btn *,
+      .feed-roll-back-btn *,
+      .feed-roll-next-btn * {
+        cursor: inherit;
+      }
       .feed-roll-back-btn,
       .feed-roll-next-btn {
         flex-direction: column;
@@ -443,8 +536,12 @@
       .feed-roll-back-btn:disabled,
       .feed-roll-next-btn:disabled {
         opacity: 0.5;
+      }
+      .feed-roll-btn .roll-btn:disabled,
+      .feed-roll-back-btn:disabled,
+      .feed-roll-next-btn:disabled {
         cursor: not-allowed;
-        pointer-events: none;
+        pointer-events: auto;
       }
     `;
     (document.head ?? document.documentElement).append(style);
@@ -456,6 +553,10 @@
     }
 
     const isBusy = pendingOperationCount > 0 || replayTargetIndex !== null;
+    const hint = statusMessage || (feedHistory.length === 0 && !getFeedData()
+      ? "尚未读取首页数据，请确认脚本运行在页面环境" : "");
+    backButton.title = hint || "返回上一组推荐";
+    nextButton.title = hint || "前往下一组推荐";
     backButton.disabled = isBusy || feedHistoryIndex <= 0;
     nextButton.disabled =
       isBusy ||
